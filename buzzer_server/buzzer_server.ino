@@ -1,6 +1,17 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <DHT.h>  // Install: Library Manager -> "DHT sensor library" by Adafruit + "Adafruit Unified Sensor"
+
+// ===== MockAPI cloud config - FILL THIS IN =====
+// MockAPI.io -> your project -> New Resource "readings" -> copy Endpoint URL here
+// Example: https://6465a133228bd07b354eb183.mockapi.io/api/v1/readings
+String MOCKAPI_URL = "";  // <-- paste your URL between quotes
+const unsigned long CLOUD_INTERVAL = 30000; // post every 30s
+unsigned long lastCloudPost = 0;
+int lastCloudCode = 0;
+String lastCloudResp = "never posted";
 
 const int BUZZER_PIN = D5; // Rewired from D8 (GPIO15 boot issue)
 const int LED_PIN = LED_BUILTIN;
@@ -26,6 +37,33 @@ bool gRelayOn = false;
 unsigned long lastSensorRead = 0;
 unsigned long lastAlarmBeep = 0;
 bool alarmBeepOn = false;
+// Onboard LED manager: buzzer/alarm use it first, else WiFi status
+bool ledAuto = true;          // true = LED shows WiFi, false = manual /led/on/off
+bool melodyPlaying = false;   // true while blocking melody drives LED directly
+unsigned long lastLedToggle = 0;
+bool ledState = false;        // false=OFF(HIGH), true=ON(LOW)
+
+void updateLed(unsigned long now) {
+  if (melodyPlaying) return; // melody handlers drive LED with delay()
+  if (gAlarm && !gAlarmMuted) {
+    // Alarm: LED follows buzzer beep
+    digitalWrite(LED_PIN, alarmBeepOn ? LOW : HIGH);
+    return;
+  }
+  if (!ledAuto) return; // manual mode, leave as user set
+  if (WiFi.status() != WL_CONNECTED) {
+    // Trying to connect / reconnecting: fast blink 200ms
+    if (now - lastLedToggle > 200) {
+      lastLedToggle = now;
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+    }
+  } else {
+    // Connected: mostly OFF, short heartbeat blink every 3s
+    unsigned long phase = now % 3000;
+    digitalWrite(LED_PIN, (phase < 120) ? LOW : HIGH);
+  }
+}
 
 // Home router WiFi (2.4GHz ONLY - ESP8266 cannot use 5GHz)
 // Connect laptop/phone to same router (Green or Green_5G both OK, same LAN)
@@ -60,38 +98,91 @@ void setRelay(bool on, const char* why) {
   Serial.printf("[RELAY] %s (%s)\n", on ? "ON" : "OFF", why);
 }
 
+void postToCloud() {
+  if (MOCKAPI_URL.length() < 10) {
+    Serial.println(F("[CLOUD] Skipped - MOCKAPI_URL empty. Paste endpoint URL in code."));
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[CLOUD] Skipped - WiFi not connected"));
+    return;
+  }
+  WiFiClientSecure client;
+  client.setInsecure(); // MockAPI uses HTTPS, skip cert check for simplicity
+  client.setTimeout(10);
+  HTTPClient http;
+  Serial.printf("[CLOUD] POST %s ...\n", MOCKAPI_URL.c_str());
+  if (!http.begin(client, MOCKAPI_URL)) {
+    Serial.println(F("[CLOUD] ERROR: http.begin failed"));
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{";
+  payload += "\"temp\":" + String(isnan(gTemp) ? "null" : String(gTemp, 1)) + ",";
+  payload += "\"hum\":" + String(isnan(gHum) ? "null" : String(gHum, 0)) + ",";
+  payload += "\"gas\":" + String(gGas) + ",";
+  payload += "\"relay\":" + String(gRelayOn ? "true" : "false") + ",";
+  payload += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false") + ",";
+  payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  payload += "\"uptime\":" + String(millis() / 1000);
+  payload += "}";
+  Serial.printf("[CLOUD] Payload: %s\n", payload.c_str());
+  lastCloudCode = http.POST(payload);
+  lastCloudResp = http.getString();
+  lastCloudResp = lastCloudResp.substring(0, 200);
+  lastCloudResp.replace("\"", "'");
+  lastCloudResp.replace("\n", " ");
+  lastCloudResp.replace("\r", " ");
+  Serial.printf("[CLOUD] Response code: %d\n[CLOUD] Body: %s\n", lastCloudCode, lastCloudResp.c_str());
+  http.end();
+}
+
 void handleRoot() {
   logRequest("PAGE  GET /");
-  String air = "Good";
-  if (gGas > GAS_ALARM) air = "DANGER - GAS LEAK!";
-  else if (gGas > GAS_FAN_ON) air = "Poor - ventilating";
-
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<meta http-equiv='refresh' content='5'>";
   html += "<style>body{font-family:Arial;text-align:center;background:#1e1e2e;color:#fff;padding:20px;}";
   html += ".card{background:#313244;padding:15px;border-radius:12px;margin:10px auto;max-width:400px;}";
   html += ".big{font-size:32px;font-weight:bold;} .danger{color:#f38ba8;} .ok{color:#a6e3a1;}";
   html += ".btn{display:inline-block;padding:12px 20px;margin:6px;font-size:16px;color:#fff;background:#74c7ec;border:none;border-radius:8px;cursor:pointer;text-decoration:none;}";
   html += ".btn-led{background:#f9e2af;color:#111;} .btn-mario{background:#a6e3a1;color:#111;} .btn-red{background:#f38ba8;color:#111;}</style></head><body>";
-  html += "<h1>Smart Room Guard</h1>";
-  html += "<div class='card'><div>Temperature</div><div class='big'>" + String(isnan(gTemp) ? "--" : String(gTemp, 1)) + " C</div>";
-  html += "<div>Humidity: " + String(isnan(gHum) ? "--" : String(gHum, 0)) + " %</div></div>";
-  html += "<div class='card'><div>Gas (MQ) raw</div><div class='big'>" + String(gGas) + " / 1023</div>";
-  html += "<div>Air: " + air + "</div></div>";
-  html += "<div class='card'><div>Relay (Fan): " + String(gRelayOn ? "ON" : "OFF") + " | Mode: " + String(gAutoMode ? "AUTO" : "MANUAL") + "</div>";
-  html += "<div>Alarm: " + String(gAlarm ? (gAlarmMuted ? "MUTED" : "ACTIVE!") : "off") + "</div></div>";
-  html += "<a href='/relay/on' class='btn'>Relay ON</a>";
-  html += "<a href='/relay/off' class='btn'>Relay OFF</a>";
-  html += "<a href='/relay/auto' class='btn'>AUTO</a>";
-  html += "<a href='/alarm/mute' class='btn btn-red'>Mute/Unmute</a><br>";
-  html += "<h3>LED</h3>";
-  html += "<a href='/led/on' class='btn btn-led'>LED ON</a>";
-  html += "<a href='/led/off' class='btn btn-led'>LED OFF</a>";
+  html += "<h1>Smart Room Guard <span style='font-size:14px;color:#a6e3a1'>LIVE</span></h1>";
+  html += "<div class='card'><div>Temperature</div><div class='big'><span id='temp'>--</span> C</div>";
+  html += "<div>Humidity: <span id='hum'>--</span> %</div></div>";
+  html += "<div class='card'><div>Gas (MQ) raw</div><div class='big'><span id='gas'>--</span> / 1023</div>";
+  html += "<div>Air: <span id='air'>--</span></div></div>";
+  html += "<div class='card'><div>Relay (Fan): <span id='relay'>--</span> | Mode: <span id='mode'>--</span></div>";
+  html += "<div>Alarm: <span id='alarm'>--</span></div><div>Board LED: <span id='led'>--</span></div><div style='font-size:12px'>Updated: <span id='upd'>--</span></div></div>";
+  html += "<button class='btn' onclick=\"cmd('/relay/on')\">Relay ON</button>";
+  html += "<button class='btn' onclick=\"cmd('/relay/off')\">Relay OFF</button>";
+  html += "<button class='btn' onclick=\"cmd('/relay/auto')\">AUTO</button>";
+  html += "<button class='btn btn-red' onclick=\"cmd('/alarm/mute')\">Mute/Unmute</button><br>";
+  html += "<h3>Board LED (auto = WiFi indicator)</h3>";
+  html += "<button class='btn btn-led' onclick=\"cmd('/led/on')\">LED ON</button>";
+  html += "<button class='btn btn-led' onclick=\"cmd('/led/off')\">LED OFF</button>";
+  html += "<button class='btn btn-led' onclick=\"cmd('/led/auto')\">LED AUTO</button>";
   html += "<h3>Melodies</h3>";
-  html += "<a href='/play/mario' class='btn btn-mario'>Mario</a>";
-  html += "<a href='/play/siren' class='btn'>Siren</a>";
+  html += "<button class='btn btn-mario' onclick=\"cmd('/play/mario')\">Mario</button>";
+  html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren</button>";
+  html += "<button class='btn' onclick=\"cmd('/note?freq=262')\">C4</button>";
+  html += "<h3>Cloud (MockAPI)</h3><div class='card'><div>Last POST: <span id='cloud'>--</span></div></div>";
+  html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Post Now</button>";
   html += "<p><a href='/api' style='color:#89b4fa'>JSON API: /api</a></p>";
-  html += "</body></html>";
+  html += "<script>";
+  html += "function cmd(u){fetch(u).then(()=>update());}";
+  html += "async function update(){try{let r=await fetch('/api');let d=await r.json();";
+  html += "document.getElementById('temp').textContent=d.temp??'--';";
+  html += "document.getElementById('hum').textContent=d.hum??'--';";
+  html += "document.getElementById('gas').textContent=d.gas;";
+  html += "let air='Good';if(d.gas>600)air='DANGER - GAS LEAK!';else if(d.gas>400)air='Poor - ventilating';";
+  html += "document.getElementById('air').textContent=air;";
+  html += "document.getElementById('relay').textContent=d.relay?'ON':'OFF';";
+  html += "document.getElementById('mode').textContent=d.auto?'AUTO':'MANUAL';";
+  html += "document.getElementById('alarm').textContent=d.alarm?'ACTIVE!':(d.muted?'MUTED':'off');";
+  html += "document.getElementById('led').textContent=d.ledAuto?('AUTO ('+(d.alarm?'ALARM blink':(d.wifi?'heartbeat':'fast blink'))+')'):(d.ledOn?'MANUAL ON':'MANUAL OFF');";
+  html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+d.cloudResp;";
+  html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
+  html += "}catch(e){}} setInterval(update,2000);update();";
+  html += "</script></body></html>";
 
   server.send(200, "text/html", html);
 }
@@ -103,6 +194,12 @@ void handleApi() {
   j += "\"gas\":" + String(gGas) + ",";
   j += "\"relay\":" + String(gRelayOn ? "true" : "false") + ",";
   j += "\"auto\":" + String(gAutoMode ? "true" : "false") + ",";
+  j += "\"muted\":" + String(gAlarmMuted ? "true" : "false") + ",";
+  j += "\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  j += "\"ledAuto\":" + String(ledAuto ? "true" : "false") + ",";
+  j += "\"ledOn\":" + String(digitalRead(LED_PIN) == LOW ? "true" : "false") + ",";
+  j += "\"cloudCode\":" + String(lastCloudCode) + ",";
+  j += "\"cloudResp\":\"" + lastCloudResp + "\",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
@@ -218,19 +315,38 @@ void setup() {
     server.sendHeader("Location", "/");
     server.send(303);
   });
+
+  server.on("/cloud/test", []() {
+    logRequest("CLOUD manual post");
+    postToCloud();
+    lastCloudPost = millis(); // reset timer
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
   
   server.on("/led/on", []() {
-    logRequest("LED   LED ON");
+    logRequest("LED   LED ON manual");
+    ledAuto = false;
+    melodyPlaying = false;
     digitalWrite(LED_PIN, LOW);
-    Serial.println("[LED] LED turned ON");
+    Serial.println("[LED] Manual ON (auto WiFi-indicator OFF, use /led/auto to restore)");
     server.sendHeader("Location", "/");
     server.send(303);
   });
 
   server.on("/led/off", []() {
-    logRequest("LED   LED OFF");
+    logRequest("LED   LED OFF manual");
+    ledAuto = false;
     digitalWrite(LED_PIN, HIGH);
-    Serial.println("[LED] LED turned OFF");
+    Serial.println("[LED] Manual OFF (auto WiFi-indicator OFF, use /led/auto to restore)");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/led/auto", []() {
+    logRequest("LED   LED AUTO");
+    ledAuto = true;
+    Serial.println("[LED] Mode -> AUTO (WiFi indicator: fast blink=connecting, heartbeat=connected, alarm blink=alarm)");
     server.sendHeader("Location", "/");
     server.send(303);
   });
@@ -239,11 +355,13 @@ void setup() {
     logRequest("BUZZ  Play single note");
     if (server.hasArg("freq")) {
       int freq = server.arg("freq").toInt();
-      Serial.printf("[BUZZ] Playing note: %d Hz\n", freq);
+      Serial.printf("[BUZZ] Playing note: %d Hz (LED follows buzzer)\n", freq);
+      melodyPlaying = true;
       digitalWrite(LED_PIN, LOW);
       tone(BUZZER_PIN, freq, 300);
       delay(300);
       digitalWrite(LED_PIN, HIGH);
+      melodyPlaying = false;
     }
     server.sendHeader("Location", "/");
     server.send(303);
@@ -251,7 +369,8 @@ void setup() {
 
   server.on("/play/siren", []() {
     logRequest("BUZZ  Play siren");
-    Serial.println("[BUZZ] Playing police siren...");
+    Serial.println("[BUZZ] Playing police siren... (LED follows buzzer)");
+    melodyPlaying = true;
     for (int i = 0; i < 3; i++) {
       for (int freq = 400; freq <= 1200; freq += 20) {
         digitalWrite(LED_PIN, (freq % 40 == 0) ? LOW : HIGH);
@@ -261,6 +380,7 @@ void setup() {
     }
     digitalWrite(LED_PIN, HIGH);
     noTone(BUZZER_PIN);
+    melodyPlaying = false;
     Serial.println("[BUZZ] Siren finished");
     server.sendHeader("Location", "/");
     server.send(303);
@@ -268,7 +388,8 @@ void setup() {
 
   server.on("/play/mario", []() {
     logRequest("BUZZ  Play mario");
-    Serial.println("[BUZZ] Playing Mario theme...");
+    Serial.println("[BUZZ] Playing Mario theme... (LED follows buzzer)");
+    melodyPlaying = true;
     int notes[] = {NOTE_E5, NOTE_E5, 0, NOTE_E5, 0, NOTE_C5, NOTE_E5, 0, NOTE_G5};
     int delays[] = {150, 150, 150, 150, 150, 150, 150, 150, 300};
     
@@ -282,6 +403,7 @@ void setup() {
       delay(delays[i] * 1.2);
       digitalWrite(LED_PIN, HIGH);
     }
+    melodyPlaying = false;
     Serial.println("[BUZZ] Mario theme finished");
     server.sendHeader("Location", "/");
     server.send(303);
@@ -295,6 +417,7 @@ void setup() {
 
   server.begin();
   Serial.println(F("[HTTP] Web server started on port 80"));
+  Serial.println(F("[LED] AUTO: fast blink=connecting, heartbeat blink=connected, beep-blink=alarm, solid=melody. /led/on/off=manual, /led/auto=restore"));
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Ready! Open http://%s in browser (laptop on Green or Green_5G)\n\n",
                   WiFi.localIP().toString().c_str());
@@ -351,6 +474,13 @@ void loop() {
       if (alarmBeepOn) tone(BUZZER_PIN, 2000);
       else noTone(BUZZER_PIN);
     }
+  }
+  // --- Board LED: buzzer/alarm first, else WiFi status ---
+  updateLed(now);
+  // --- Cloud post to MockAPI every CLOUD_INTERVAL ---
+  if (now - lastCloudPost > CLOUD_INTERVAL) {
+    lastCloudPost = now;
+    postToCloud();
   }
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastRetry = 0;
