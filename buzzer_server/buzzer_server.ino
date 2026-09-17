@@ -7,11 +7,13 @@
 // ===== MockAPI cloud config - FILL THIS IN =====
 // MockAPI.io -> your project -> New Resource "readings" -> copy Endpoint URL here
 // Example: https://6465a133228bd07b354eb183.mockapi.io/api/v1/readings
-String MOCKAPI_URL = "";  // <-- paste your URL between quotes
-const unsigned long CLOUD_INTERVAL = 30000; // post every 30s
+String MOCKAPI_URL = "https://6465a133228bd07b354eb182.mockapi.io/readings";  // readings resource, 0 items now
+const unsigned long CLOUD_INTERVAL = 30000; // auto post every 30s (change to 60000 to fill slower)
+const int CLOUD_MAX_KEEP = 80; // keep newest 80, delete older so limit 100 never hits
 unsigned long lastCloudPost = 0;
 int lastCloudCode = 0;
 String lastCloudResp = "never posted";
+String lastCloudDel = "-";
 
 const int BUZZER_PIN = D5; // Rewired from D8 (GPIO15 boot issue)
 const int LED_PIN = LED_BUILTIN;
@@ -98,6 +100,24 @@ void setRelay(bool on, const char* why) {
   Serial.printf("[RELAY] %s (%s)\n", on ? "ON" : "OFF", why);
 }
 
+void deleteOldReading(long delId) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10);
+  HTTPClient http;
+  String url = MOCKAPI_URL + "/" + String(delId);
+  Serial.printf("[CLOUD] Cleanup DELETE %s (keeping newest %d)...\n", url.c_str(), CLOUD_MAX_KEEP);
+  if (!http.begin(client, url)) {
+    Serial.println(F("[CLOUD] Cleanup ERROR: http.begin failed"));
+    return;
+  }
+  int code = http.sendRequest("DELETE");
+  String body = http.getString().substring(0, 100);
+  Serial.printf("[CLOUD] Cleanup DELETE id=%ld -> code %d %s\n", delId, code, body.c_str());
+  lastCloudDel = String(delId) + " (code " + String(code) + ")";
+  http.end();
+}
+
 void postToCloud() {
   if (MOCKAPI_URL.length() < 10) {
     Serial.println(F("[CLOUD] Skipped - MOCKAPI_URL empty. Paste endpoint URL in code."));
@@ -128,12 +148,31 @@ void postToCloud() {
   payload += "}";
   Serial.printf("[CLOUD] Payload: %s\n", payload.c_str());
   lastCloudCode = http.POST(payload);
-  lastCloudResp = http.getString();
-  lastCloudResp = lastCloudResp.substring(0, 200);
+  String raw = http.getString();
+  Serial.printf("[CLOUD] Response code: %d\n[CLOUD] Body: %s\n", lastCloudCode, raw.substring(0, 200).c_str());
+  // Rolling cleanup: parse new record id, delete (id - MAX_KEEP) = oldest tail
+  if (lastCloudCode == 200 || lastCloudCode == 201) {
+    int p = raw.indexOf("\"id\"");
+    if (p > 0) {
+      int c1 = raw.indexOf(":", p) + 1;
+      int c2 = raw.indexOf(",", c1);
+      if (c2 < 0) c2 = raw.indexOf("}", c1);
+      String idStr = raw.substring(c1, c2);
+      idStr.replace("\"", "");
+      idStr.trim();
+      long newId = idStr.toInt();
+      if (newId > CLOUD_MAX_KEEP) {
+        http.end(); // close POST before DELETE (frees BearSSL)
+        deleteOldReading(newId - CLOUD_MAX_KEEP);
+        lastCloudResp = "id " + idStr + " ok";
+        return;
+      }
+    }
+  }
+  lastCloudResp = raw.substring(0, 200);
   lastCloudResp.replace("\"", "'");
   lastCloudResp.replace("\n", " ");
   lastCloudResp.replace("\r", " ");
-  Serial.printf("[CLOUD] Response code: %d\n[CLOUD] Body: %s\n", lastCloudCode, lastCloudResp.c_str());
   http.end();
 }
 
@@ -164,7 +203,7 @@ void handleRoot() {
   html += "<button class='btn btn-mario' onclick=\"cmd('/play/mario')\">Mario</button>";
   html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren</button>";
   html += "<button class='btn' onclick=\"cmd('/note?freq=262')\">C4</button>";
-  html += "<h3>Cloud (MockAPI)</h3><div class='card'><div>Last POST: <span id='cloud'>--</span></div></div>";
+  html += "<h3>Cloud (MockAPI)</h3><div class='card'><div>Last POST: <span id='cloud'>--</span></div><div>Last DELETE: <span id='clouddel'>--</span></div><div style='font-size:12px'>Auto every 30s, keeps newest 80/100</div></div>";
   html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Post Now</button>";
   html += "<p><a href='/api' style='color:#89b4fa'>JSON API: /api</a></p>";
   html += "<script>";
@@ -180,6 +219,7 @@ void handleRoot() {
   html += "document.getElementById('alarm').textContent=d.alarm?'ACTIVE!':(d.muted?'MUTED':'off');";
   html += "document.getElementById('led').textContent=d.ledAuto?('AUTO ('+(d.alarm?'ALARM blink':(d.wifi?'heartbeat':'fast blink'))+')'):(d.ledOn?'MANUAL ON':'MANUAL OFF');";
   html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+d.cloudResp;";
+  html += "document.getElementById('clouddel').textContent=d.cloudDel;";
   html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
   html += "}catch(e){}} setInterval(update,2000);update();";
   html += "</script></body></html>";
@@ -200,6 +240,7 @@ void handleApi() {
   j += "\"ledOn\":" + String(digitalRead(LED_PIN) == LOW ? "true" : "false") + ",";
   j += "\"cloudCode\":" + String(lastCloudCode) + ",";
   j += "\"cloudResp\":\"" + lastCloudResp + "\",";
+  j += "\"cloudDel\":\"" + lastCloudDel + "\",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
