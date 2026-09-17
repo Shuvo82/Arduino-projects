@@ -1,8 +1,31 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <DHT.h>  // Install: Library Manager -> "DHT sensor library" by Adafruit + "Adafruit Unified Sensor"
 
-const int BUZZER_PIN = D5; // NOTE: moved from D8 (GPIO15 must be LOW at boot or WiFi/AP fails). Rewire buzzer to D5.
+const int BUZZER_PIN = D5; // Rewired from D8 (GPIO15 boot issue)
 const int LED_PIN = LED_BUILTIN;
+const int DHT_PIN = D6;      // DHT11/DHT22 data -> D6
+const int RELAY_PIN = D1;    // Relay IN -> D1 (safe pin)
+const int GAS_PIN = A0;      // MQ-2/MQ-135 AO -> A0 (only analog pin)
+
+#define DHTTYPE DHT11        // blue box = DHT11
+DHT dht(DHT_PIN, DHTTYPE);
+
+// Thresholds - tune to your room
+const float TEMP_FAN_ON = 32.0;   // relay ON above this
+const float TEMP_ALARM = 40.0;    // buzzer alarm above this
+const int GAS_FAN_ON = 400;       // 0-1023, relay ON above this
+const int GAS_ALARM = 600;        // buzzer alarm above this
+
+float gTemp = NAN, gHum = NAN;
+int gGas = 0;
+bool gAlarm = false;
+bool gAlarmMuted = false;
+bool gAutoMode = true;
+bool gRelayOn = false;
+unsigned long lastSensorRead = 0;
+unsigned long lastAlarmBeep = 0;
+bool alarmBeepOn = false;
 
 // Home router WiFi (2.4GHz ONLY - ESP8266 cannot use 5GHz)
 // Connect laptop/phone to same router (Green or Green_5G both OK, same LAN)
@@ -31,32 +54,58 @@ void logRequest(const char* action) {
                 server.uri().c_str());
 }
 
+void setRelay(bool on, const char* why) {
+  gRelayOn = on;
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH); // most relay boards are Active LOW
+  Serial.printf("[RELAY] %s (%s)\n", on ? "ON" : "OFF", why);
+}
+
 void handleRoot() {
   logRequest("PAGE  GET /");
+  String air = "Good";
+  if (gGas > GAS_ALARM) air = "DANGER - GAS LEAK!";
+  else if (gGas > GAS_FAN_ON) air = "Poor - ventilating";
+
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='5'>";
   html += "<style>body{font-family:Arial;text-align:center;background:#1e1e2e;color:#fff;padding:20px;}";
-  html += ".btn{display:inline-block;padding:15px 25px;margin:10px;font-size:18px;color:#fff;background:#74c7ec;border:none;border-radius:8px;cursor:pointer;text-decoration:none;}";
-  html += ".btn-led{background:#f9e2af;color:#111;} .btn-mario{background:#a6e3a1;color:#111;}</style></head><body>";
-  html += "<h1>NodeMCU Sound & Light Studio</h1>";
-  html += "<p>Control LED and Buzzer over Wi-Fi</p>";
-  
-  html += "<h3>Toggle LED</h3>";
+  html += ".card{background:#313244;padding:15px;border-radius:12px;margin:10px auto;max-width:400px;}";
+  html += ".big{font-size:32px;font-weight:bold;} .danger{color:#f38ba8;} .ok{color:#a6e3a1;}";
+  html += ".btn{display:inline-block;padding:12px 20px;margin:6px;font-size:16px;color:#fff;background:#74c7ec;border:none;border-radius:8px;cursor:pointer;text-decoration:none;}";
+  html += ".btn-led{background:#f9e2af;color:#111;} .btn-mario{background:#a6e3a1;color:#111;} .btn-red{background:#f38ba8;color:#111;}</style></head><body>";
+  html += "<h1>Smart Room Guard</h1>";
+  html += "<div class='card'><div>Temperature</div><div class='big'>" + String(isnan(gTemp) ? "--" : String(gTemp, 1)) + " C</div>";
+  html += "<div>Humidity: " + String(isnan(gHum) ? "--" : String(gHum, 0)) + " %</div></div>";
+  html += "<div class='card'><div>Gas (MQ) raw</div><div class='big'>" + String(gGas) + " / 1023</div>";
+  html += "<div>Air: " + air + "</div></div>";
+  html += "<div class='card'><div>Relay (Fan): " + String(gRelayOn ? "ON" : "OFF") + " | Mode: " + String(gAutoMode ? "AUTO" : "MANUAL") + "</div>";
+  html += "<div>Alarm: " + String(gAlarm ? (gAlarmMuted ? "MUTED" : "ACTIVE!") : "off") + "</div></div>";
+  html += "<a href='/relay/on' class='btn'>Relay ON</a>";
+  html += "<a href='/relay/off' class='btn'>Relay OFF</a>";
+  html += "<a href='/relay/auto' class='btn'>AUTO</a>";
+  html += "<a href='/alarm/mute' class='btn btn-red'>Mute/Unmute</a><br>";
+  html += "<h3>LED</h3>";
   html += "<a href='/led/on' class='btn btn-led'>LED ON</a>";
   html += "<a href='/led/off' class='btn btn-led'>LED OFF</a>";
-  
-  html += "<h3>Play Melodies</h3>";
-  html += "<a href='/play/mario' class='btn btn-mario'>Play Mario Theme</a>";
-  html += "<a href='/play/siren' class='btn'>Play Police Siren</a>";
-  
-  html += "<h3>Play Single Notes</h3>";
-  html += "<a href='/note?freq=262' class='btn'>C4</a>";
-  html += "<a href='/note?freq=330' class='btn'>E4</a>";
-  html += "<a href='/note?freq=392' class='btn'>G4</a>";
-  html += "<a href='/note?freq=523' class='btn'>C5</a>";
-  
+  html += "<h3>Melodies</h3>";
+  html += "<a href='/play/mario' class='btn btn-mario'>Mario</a>";
+  html += "<a href='/play/siren' class='btn'>Siren</a>";
+  html += "<p><a href='/api' style='color:#89b4fa'>JSON API: /api</a></p>";
   html += "</body></html>";
-  
+
   server.send(200, "text/html", html);
+}
+
+void handleApi() {
+  String j = "{";
+  j += "\"temp\":" + String(isnan(gTemp) ? "null" : String(gTemp, 1)) + ",";
+  j += "\"hum\":" + String(isnan(gHum) ? "null" : String(gHum, 0)) + ",";
+  j += "\"gas\":" + String(gGas) + ",";
+  j += "\"relay\":" + String(gRelayOn ? "true" : "false") + ",";
+  j += "\"auto\":" + String(gAutoMode ? "true" : "false") + ",";
+  j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
+  j += "}";
+  server.send(200, "application/json", j);
 }
 
 void setup() {
@@ -64,14 +113,19 @@ void setup() {
   delay(500);
   Serial.println();
   Serial.println(F("======================================"));
-  Serial.println(F(" NodeMCU Sound & Light Studio"));
+  Serial.println(F(" Smart Room Guard"));
   Serial.println(F(" Booting..."));
   Serial.println(F("======================================"));
+  Serial.println(F("[WIRING] DHT data->D6, MQ AO->A0, Relay IN->D1, Buzzer->D5"));
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH); // Turn off LED (Active LOW)
   digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH); // relay OFF (Active LOW)
+  dht.begin();
+  Serial.println(F("[SENS] DHT + MQ + Relay init done"));
 
   // --- Connect to home router (STA mode, 2.4GHz only) ---
   WiFi.persistent(false);
@@ -126,6 +180,44 @@ void setup() {
 
   // Web routes
   server.on("/", handleRoot);
+  server.on("/api", []() {
+    logRequest("API   GET /api");
+    handleApi();
+  });
+
+  server.on("/relay/on", []() {
+    logRequest("RELAY ON manual");
+    gAutoMode = false;
+    noTone(BUZZER_PIN);
+    setRelay(true, "web manual");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/relay/off", []() {
+    logRequest("RELAY OFF manual");
+    gAutoMode = false;
+    setRelay(false, "web manual");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/relay/auto", []() {
+    logRequest("RELAY AUTO mode");
+    gAutoMode = true;
+    Serial.println("[RELAY] Mode -> AUTO");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/alarm/mute", []() {
+    logRequest("ALARM mute toggle");
+    gAlarmMuted = !gAlarmMuted;
+    if (gAlarmMuted) noTone(BUZZER_PIN);
+    Serial.printf("[ALARM] Muted: %s\n", gAlarmMuted ? "YES" : "NO");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
   
   server.on("/led/on", []() {
     logRequest("LED   LED ON");
@@ -215,9 +307,51 @@ unsigned long lastStatusPrint = 0;
 
 void loop() {
   server.handleClient();
-
-  // Auto-reconnect + heartbeat every 10s
   unsigned long now = millis();
+
+  // --- Read sensors every 2s ---
+  if (now - lastSensorRead > 2000) {
+    lastSensorRead = now;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    int gas = analogRead(GAS_PIN);
+    if (!isnan(t)) gTemp = t;
+    if (!isnan(h)) gHum = h;
+    gGas = gas;
+
+    if (isnan(t) || isnan(h)) {
+      Serial.println(F("[SENS] DHT read FAILED (check wiring D6, type DHT11 vs DHT22)"));
+    } else {
+      Serial.printf("[SENS] Temp: %.1f C | Hum: %.0f %% | Gas: %d/1023\n", gTemp, gHum, gGas);
+    }
+
+    // Alarm + auto relay logic
+    bool shouldAlarm = (!isnan(gTemp) && gTemp > TEMP_ALARM) || (gGas > GAS_ALARM);
+    if (shouldAlarm && !gAlarm) {
+      Serial.println(F("[ALARM] TRIGGERED! (high temp or gas leak)"));
+    } else if (!shouldAlarm && gAlarm) {
+      Serial.println(F("[ALARM] Cleared"));
+      noTone(BUZZER_PIN);
+      alarmBeepOn = false;
+    }
+    gAlarm = shouldAlarm;
+    if (gAlarmMuted && !gAlarm) gAlarmMuted = false; // auto unmute when safe
+
+    if (gAutoMode) {
+      bool wantRelay = (!isnan(gTemp) && gTemp > TEMP_FAN_ON) || (gGas > GAS_FAN_ON);
+      if (wantRelay != gRelayOn) setRelay(wantRelay, "auto temp/gas");
+    }
+  }
+
+  // --- Non-blocking alarm beep (2kHz, 300ms on/off) ---
+  if (gAlarm && !gAlarmMuted) {
+    if (now - lastAlarmBeep > 300) {
+      lastAlarmBeep = now;
+      alarmBeepOn = !alarmBeepOn;
+      if (alarmBeepOn) tone(BUZZER_PIN, 2000);
+      else noTone(BUZZER_PIN);
+    }
+  }
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastRetry = 0;
     if (now - lastRetry > 10000) {
