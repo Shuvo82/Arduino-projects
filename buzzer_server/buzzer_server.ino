@@ -4,16 +4,13 @@
 #include <WiFiClientSecure.h>
 #include <DHT.h>  // Install: Library Manager -> "DHT sensor library" by Adafruit + "Adafruit Unified Sensor"
 
-// ===== MockAPI cloud config - FILL THIS IN =====
-// MockAPI.io -> your project -> New Resource "readings" -> copy Endpoint URL here
-// Example: https://6465a133228bd07b354eb183.mockapi.io/api/v1/readings
-String MOCKAPI_URL = "https://6465a133228bd07b354eb182.mockapi.io/readings";  // readings resource, 0 items now
-const unsigned long CLOUD_INTERVAL = 30000; // auto post every 30s (change to 60000 to fill slower)
-const int CLOUD_MAX_KEEP = 80; // keep newest 80, delete older so limit 100 never hits
+// ===== MockAPI cloud config: single-row live state (PUT id=1, never fills 100) =====
+String MOCKAPI_URL = "https://6465a133228bd07b354eb182.mockapi.io/readings";
+const String CLOUD_FIXED_ID = "1"; // always overwrite row 1
+const unsigned long CLOUD_INTERVAL = 30000; // auto PUT every 30s
 unsigned long lastCloudPost = 0;
 int lastCloudCode = 0;
 String lastCloudResp = "never posted";
-String lastCloudDel = "-";
 
 const int BUZZER_PIN = D5; // Rewired from D8 (GPIO15 boot issue)
 const int LED_PIN = LED_BUILTIN;
@@ -100,81 +97,60 @@ void setRelay(bool on, const char* why) {
   Serial.printf("[RELAY] %s (%s)\n", on ? "ON" : "OFF", why);
 }
 
-void deleteOldReading(long delId) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10);
-  HTTPClient http;
-  String url = MOCKAPI_URL + "/" + String(delId);
-  Serial.printf("[CLOUD] Cleanup DELETE %s (keeping newest %d)...\n", url.c_str(), CLOUD_MAX_KEEP);
-  if (!http.begin(client, url)) {
-    Serial.println(F("[CLOUD] Cleanup ERROR: http.begin failed"));
-    return;
-  }
-  int code = http.sendRequest("DELETE");
-  String body = http.getString().substring(0, 100);
-  Serial.printf("[CLOUD] Cleanup DELETE id=%ld -> code %d %s\n", delId, code, body.c_str());
-  lastCloudDel = String(delId) + " (code " + String(code) + ")";
-  http.end();
-}
-
-void postToCloud() {
-  if (MOCKAPI_URL.length() < 10) {
-    Serial.println(F("[CLOUD] Skipped - MOCKAPI_URL empty. Paste endpoint URL in code."));
-    return;
-  }
+// Single PUT to fixed id: overwrites row 1, row count stays 1, no DELETE needed.
+void cloudUpdate() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[CLOUD] Skipped - WiFi not connected"));
     return;
   }
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+    "{\"temp\":%s,\"hum\":%s,\"gas\":%d,\"relay\":%s,\"alarm\":%s,\"rssi\":%d,\"uptime\":%lu}",
+    isnan(gTemp) ? "null" : String(gTemp, 1).c_str(),
+    isnan(gHum) ? "null" : String(gHum, 0).c_str(),
+    gGas,
+    gRelayOn ? "true" : "false",
+    (gAlarm && !gAlarmMuted) ? "true" : "false",
+    WiFi.RSSI(),
+    millis() / 1000);
+
   WiFiClientSecure client;
-  client.setInsecure(); // MockAPI uses HTTPS, skip cert check for simplicity
-  client.setTimeout(10);
+  client.setInsecure();
+  client.setTimeout(15);
   HTTPClient http;
-  Serial.printf("[CLOUD] POST %s ...\n", MOCKAPI_URL.c_str());
-  if (!http.begin(client, MOCKAPI_URL)) {
+  String url = MOCKAPI_URL + "/" + CLOUD_FIXED_ID;
+  Serial.printf("[CLOUD] PUT %s (heap %d)\n[CLOUD] Payload: %s\n", url.c_str(), ESP.getFreeHeap(), payload);
+  if (!http.begin(client, url)) {
     Serial.println(F("[CLOUD] ERROR: http.begin failed"));
+    lastCloudCode = -100;
     return;
   }
   http.addHeader("Content-Type", "application/json");
-  String payload = "{";
-  payload += "\"temp\":" + String(isnan(gTemp) ? "null" : String(gTemp, 1)) + ",";
-  payload += "\"hum\":" + String(isnan(gHum) ? "null" : String(gHum, 0)) + ",";
-  payload += "\"gas\":" + String(gGas) + ",";
-  payload += "\"relay\":" + String(gRelayOn ? "true" : "false") + ",";
-  payload += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false") + ",";
-  payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  payload += "\"uptime\":" + String(millis() / 1000);
-  payload += "}";
-  Serial.printf("[CLOUD] Payload: %s\n", payload.c_str());
-  lastCloudCode = http.POST(payload);
+  lastCloudCode = http.PUT(payload);
   String raw = http.getString();
-  Serial.printf("[CLOUD] Response code: %d\n[CLOUD] Body: %s\n", lastCloudCode, raw.substring(0, 200).c_str());
-  // Rolling cleanup: parse new record id, delete (id - MAX_KEEP) = oldest tail
-  if (lastCloudCode == 200 || lastCloudCode == 201) {
-    int p = raw.indexOf("\"id\"");
-    if (p > 0) {
-      int c1 = raw.indexOf(":", p) + 1;
-      int c2 = raw.indexOf(",", c1);
-      if (c2 < 0) c2 = raw.indexOf("}", c1);
-      String idStr = raw.substring(c1, c2);
-      idStr.replace("\"", "");
-      idStr.trim();
-      long newId = idStr.toInt();
-      if (newId > CLOUD_MAX_KEEP) {
-        http.end(); // close POST before DELETE (frees BearSSL)
-        deleteOldReading(newId - CLOUD_MAX_KEEP);
-        lastCloudResp = "id " + idStr + " ok";
-        return;
-      }
-    }
+  if (lastCloudCode < 0) {
+    Serial.printf("[CLOUD] PUT failed %d (%s), retrying once...\n", lastCloudCode, http.errorToString(lastCloudCode).c_str());
+    delay(800);
+    yield();
+    lastCloudCode = http.PUT(payload);
+    raw = http.getString();
   }
-  lastCloudResp = raw.substring(0, 200);
-  lastCloudResp.replace("\"", "'");
-  lastCloudResp.replace("\n", " ");
-  lastCloudResp.replace("\r", " ");
+  Serial.printf("[CLOUD] PUT -> code %d (%s) %s\n", lastCloudCode, http.errorToString(lastCloudCode).c_str(), raw.substring(0, 120).c_str());
+  if (lastCloudCode == 404) {
+    Serial.println(F("[CLOUD] TIP: row id=1 missing - in MockAPI create one row (POST) or Reset, so PUT /1 has a target."));
+    lastCloudResp = "404: create row id=1 first";
+  } else {
+    lastCloudResp = raw.substring(0, 120);
+    lastCloudResp.replace("\"", "'");
+    lastCloudResp.replace("\n", " ");
+  }
   http.end();
+  delay(300);
+  yield();
 }
+
+// Kept name so existing callers/routes keep working
+void postToCloud() { cloudUpdate(); }
 
 void handleRoot() {
   logRequest("PAGE  GET /");
@@ -203,8 +179,8 @@ void handleRoot() {
   html += "<button class='btn btn-mario' onclick=\"cmd('/play/mario')\">Mario</button>";
   html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren</button>";
   html += "<button class='btn' onclick=\"cmd('/note?freq=262')\">C4</button>";
-  html += "<h3>Cloud (MockAPI)</h3><div class='card'><div>Last POST: <span id='cloud'>--</span></div><div>Last DELETE: <span id='clouddel'>--</span></div><div style='font-size:12px'>Auto every 30s, keeps newest 80/100</div></div>";
-  html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Post Now</button>";
+  html += "<h3>Cloud (MockAPI PUT id=1)</h3><div class='card'><div>Last PUT: <span id='cloud'>--</span></div><div style='font-size:12px'>Auto every 30s, single row, never fills</div></div>";
+  html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Update Now</button>";
   html += "<p><a href='/api' style='color:#89b4fa'>JSON API: /api</a></p>";
   html += "<script>";
   html += "function cmd(u){fetch(u).then(()=>update());}";
@@ -219,7 +195,6 @@ void handleRoot() {
   html += "document.getElementById('alarm').textContent=d.alarm?'ACTIVE!':(d.muted?'MUTED':'off');";
   html += "document.getElementById('led').textContent=d.ledAuto?('AUTO ('+(d.alarm?'ALARM blink':(d.wifi?'heartbeat':'fast blink'))+')'):(d.ledOn?'MANUAL ON':'MANUAL OFF');";
   html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+d.cloudResp;";
-  html += "document.getElementById('clouddel').textContent=d.cloudDel;";
   html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
   html += "}catch(e){}} setInterval(update,2000);update();";
   html += "</script></body></html>";
@@ -240,7 +215,6 @@ void handleApi() {
   j += "\"ledOn\":" + String(digitalRead(LED_PIN) == LOW ? "true" : "false") + ",";
   j += "\"cloudCode\":" + String(lastCloudCode) + ",";
   j += "\"cloudResp\":\"" + lastCloudResp + "\",";
-  j += "\"cloudDel\":\"" + lastCloudDel + "\",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
@@ -358,7 +332,7 @@ void setup() {
   });
 
   server.on("/cloud/test", []() {
-    logRequest("CLOUD manual post");
+    logRequest("CLOUD manual PUT");
     postToCloud();
     lastCloudPost = millis(); // reset timer
     server.sendHeader("Location", "/");
@@ -518,7 +492,7 @@ void loop() {
   }
   // --- Board LED: buzzer/alarm first, else WiFi status ---
   updateLed(now);
-  // --- Cloud post to MockAPI every CLOUD_INTERVAL ---
+  // --- Cloud PUT to MockAPI every CLOUD_INTERVAL (single row id=1) ---
   if (now - lastCloudPost > CLOUD_INTERVAL) {
     lastCloudPost = now;
     postToCloud();
