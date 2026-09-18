@@ -47,11 +47,22 @@ bool alarmBeepOn = false;
 // Onboard LED manager: buzzer/alarm use it first, else WiFi status
 bool ledAuto = true;          // true = LED shows WiFi, false = manual /led/on/off
 bool melodyPlaying = false;   // true while blocking melody drives LED directly
+bool sirenOn = false;         // continuous siren until /play/stop
+int sirenFreq = 400;
+unsigned long lastSirenStep = 0;
 unsigned long lastLedToggle = 0;
 bool ledState = false;        // false=OFF(HIGH), true=ON(LOW)
 
+void stopSounds(const char* why) {
+  sirenOn = false;
+  melodyPlaying = false;
+  noTone(BUZZER_PIN);
+  digitalWrite(LED_PIN, HIGH);
+  Serial.printf("[BUZZ] Stopped (%s)\n", why);
+}
+
 void updateLed(unsigned long now) {
-  if (melodyPlaying) return; // melody handlers drive LED with delay()
+  if (melodyPlaying || sirenOn) return; // siren/melody handlers drive LED directly
   if (gAlarm && !gAlarmMuted) {
     // Alarm: LED follows buzzer beep
     digitalWrite(LED_PIN, alarmBeepOn ? LOW : HIGH);
@@ -211,7 +222,7 @@ void handleRoot() {
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<style>body{font-family:Arial;text-align:center;background:#1e1e2e;color:#fff;padding:20px;}";
   html += ".card{background:#313244;padding:15px;border-radius:12px;margin:10px auto;max-width:400px;overflow:hidden;}";
-  html += ".stat{font-size:12px;word-break:break-all;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.4;}";
+  html += ".stat{font-size:14px;word-break:break-word;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.5;text-align:center;}";
   html += ".big{font-size:32px;font-weight:bold;} .danger{color:#f38ba8;} .ok{color:#a6e3a1;}";
   html += ".btn{display:inline-block;padding:12px 20px;margin:6px;font-size:16px;color:#fff;background:#74c7ec;border:none;border-radius:8px;cursor:pointer;text-decoration:none;}";
   html += ".btn-led{background:#f9e2af;color:#111;} .btn-mario{background:#a6e3a1;color:#111;} .btn-red{background:#f38ba8;color:#111;}</style></head><body>";
@@ -230,9 +241,13 @@ void handleRoot() {
   html += "<button class='btn btn-led' onclick=\"cmd('/led/on')\">LED ON</button>";
   html += "<button class='btn btn-led' onclick=\"cmd('/led/off')\">LED OFF</button>";
   html += "<button class='btn btn-led' onclick=\"cmd('/led/auto')\">LED AUTO</button>";
-  html += "<h3>Melodies</h3>";
+  html += "<h3>Sounds</h3><div>Siren: <span id='siren'>--</span></div>";
   html += "<button class='btn btn-mario' onclick=\"cmd('/play/mario')\">Mario</button>";
-  html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren</button>";
+  html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren Start</button>";
+  html += "<button class='btn btn-red' onclick=\"cmd('/play/stop')\">Stop Sound</button><br>";
+  html += "<button class='btn' onclick=\"cmd('/play/doorbell')\">Doorbell</button>";
+  html += "<button class='btn' onclick=\"cmd('/play/ambulance')\">Ambulance</button>";
+  html += "<button class='btn' onclick=\"cmd('/play/success')\">Success</button>";
   html += "<button class='btn' onclick=\"cmd('/note?freq=262')\">C4</button>";
   html += "<h3>Cloud (MockAPI PUT id=1)</h3><div class='card'><div>Last PUT:</div><div class='stat'><span id='cloud'>--</span></div><div style='font-size:12px'>Auto every 30s, single row, never fills</div></div>";
   html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Update Now</button>";
@@ -251,8 +266,9 @@ void handleRoot() {
   html += "document.getElementById('mode').textContent=d.auto?'AUTO':'MANUAL';";
   html += "document.getElementById('alarm').textContent=d.alarm?'ACTIVE!':(d.muted?'MUTED':'off');";
   html += "document.getElementById('led').textContent=d.ledAuto?('AUTO ('+(d.alarm?'ALARM blink':(d.wifi?'heartbeat':'fast blink'))+')'):(d.ledOn?'MANUAL ON':'MANUAL OFF');";
-  html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+(d.cloudResp||'').substring(0,80);";
-  html += "document.getElementById('tg').textContent='code '+d.tgCode+' | '+(d.tgResp||'').substring(0,60);";
+  html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+(d.cloudResp||'');";
+  html += "document.getElementById('tg').textContent='code '+d.tgCode+' | '+(d.tgResp||'');";
+  html += "document.getElementById('siren').textContent=d.siren?'RUNNING (press Stop)':'off';";
   html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
   html += "}catch(e){}} setInterval(update,2000);update();";
   html += "</script></body></html>";
@@ -275,6 +291,7 @@ void handleApi() {
   j += "\"cloudResp\":\"" + lastCloudResp + "\",";
   j += "\"tgCode\":" + String(lastTgCode) + ",";
   j += "\"tgResp\":\"" + lastTgResp + "\",";
+  j += "\"siren\":" + String(sirenOn ? "true" : "false") + ",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
@@ -409,9 +426,9 @@ void setup() {
   server.on("/led/on", []() {
     logRequest("LED   LED ON manual");
     ledAuto = false;
-    melodyPlaying = false;
+    stopSounds("LED manual");
     digitalWrite(LED_PIN, LOW);
-    Serial.println("[LED] Manual ON (auto WiFi-indicator OFF, use /led/auto to restore)");
+    Serial.println("[LED] Manual ON (siren stopped, auto WiFi-indicator OFF, use /led/auto to restore)");
     server.sendHeader("Location", "/");
     server.send(303);
   });
@@ -419,8 +436,9 @@ void setup() {
   server.on("/led/off", []() {
     logRequest("LED   LED OFF manual");
     ledAuto = false;
+    stopSounds("LED manual");
     digitalWrite(LED_PIN, HIGH);
-    Serial.println("[LED] Manual OFF (auto WiFi-indicator OFF, use /led/auto to restore)");
+    Serial.println("[LED] Manual OFF (siren stopped, auto WiFi-indicator OFF, use /led/auto to restore)");
     server.sendHeader("Location", "/");
     server.send(303);
   });
@@ -450,20 +468,74 @@ void setup() {
   });
 
   server.on("/play/siren", []() {
-    logRequest("BUZZ  Play siren");
-    Serial.println("[BUZZ] Playing police siren... (LED follows buzzer)");
+    logRequest("BUZZ  Siren START (continuous)");
+    stopSounds("siren restart");
+    sirenOn = true;
+    sirenFreq = 400;
+    lastSirenStep = millis();
+    Serial.println("[BUZZ] Siren STARTED continuous - use /play/stop to stop (LED follows siren)");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/play/stop", []() {
+    logRequest("BUZZ  Stop all sounds");
+    stopSounds("web button");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/play/doorbell", []() {
+    logRequest("BUZZ  Doorbell ding-dong");
+    stopSounds("doorbell");
     melodyPlaying = true;
-    for (int i = 0; i < 3; i++) {
-      for (int freq = 400; freq <= 1200; freq += 20) {
-        digitalWrite(LED_PIN, (freq % 40 == 0) ? LOW : HIGH);
-        tone(BUZZER_PIN, freq, 10);
-        delay(10);
-      }
+    Serial.println("[BUZZ] Doorbell...");
+    digitalWrite(LED_PIN, LOW);
+    tone(BUZZER_PIN, NOTE_E5, 300); delay(350);
+    digitalWrite(LED_PIN, HIGH); delay(100);
+    digitalWrite(LED_PIN, LOW);
+    tone(BUZZER_PIN, NOTE_C5, 500); delay(550);
+    digitalWrite(LED_PIN, HIGH);
+    noTone(BUZZER_PIN);
+    melodyPlaying = false;
+    Serial.println("[BUZZ] Doorbell finished");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/play/ambulance", []() {
+    logRequest("BUZZ  Ambulance two-tone");
+    stopSounds("ambulance");
+    melodyPlaying = true;
+    Serial.println("[BUZZ] Ambulance (5x two-tone)...");
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, LOW);
+      tone(BUZZER_PIN, 700, 400); delay(450);
+      digitalWrite(LED_PIN, HIGH);
+      tone(BUZZER_PIN, 950, 400); delay(450);
     }
     digitalWrite(LED_PIN, HIGH);
     noTone(BUZZER_PIN);
     melodyPlaying = false;
-    Serial.println("[BUZZ] Siren finished");
+    Serial.println("[BUZZ] Ambulance finished");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/play/success", []() {
+    logRequest("BUZZ  Success jingle");
+    stopSounds("success");
+    melodyPlaying = true;
+    Serial.println("[BUZZ] Success jingle...");
+    int seq[] = {NOTE_C4, NOTE_E4, NOTE_G4, NOTE_C5};
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(LED_PIN, LOW);
+      tone(BUZZER_PIN, seq[i], 150); delay(180);
+    }
+    digitalWrite(LED_PIN, HIGH);
+    noTone(BUZZER_PIN);
+    melodyPlaying = false;
+    Serial.println("[BUZZ] Success finished");
     server.sendHeader("Location", "/");
     server.send(303);
   });
@@ -552,13 +624,24 @@ void loop() {
     }
   }
 
-  // --- Non-blocking alarm beep (2kHz, 300ms on/off) ---
-  if (gAlarm && !gAlarmMuted) {
+  // --- Non-blocking alarm beep (2kHz, 300ms on/off), wins over siren ---
+  bool alarmActive = (gAlarm && !gAlarmMuted);
+  if (alarmActive) {
     if (now - lastAlarmBeep > 300) {
       lastAlarmBeep = now;
       alarmBeepOn = !alarmBeepOn;
       if (alarmBeepOn) tone(BUZZER_PIN, 2000);
       else noTone(BUZZER_PIN);
+    }
+  }
+  // --- Continuous siren sweep (paused while safety alarm beeps) ---
+  if (sirenOn && !alarmActive && !melodyPlaying) {
+    if (now - lastSirenStep > 15) {
+      lastSirenStep = now;
+      sirenFreq += 20;
+      if (sirenFreq > 1200) sirenFreq = 400;
+      tone(BUZZER_PIN, sirenFreq);
+      digitalWrite(LED_PIN, (sirenFreq % 40 == 0) ? LOW : HIGH);
     }
   }
   // --- Board LED: buzzer/alarm first, else WiFi status ---
