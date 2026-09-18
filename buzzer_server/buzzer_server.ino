@@ -4,6 +4,14 @@
 #include <WiFiClientSecure.h>
 #include <DHT.h>  // Install: Library Manager -> "DHT sensor library" by Adafruit + "Adafruit Unified Sensor"
 
+// ===== Telegram alerts (Foster82_bot) =====
+const String TG_TOKEN = "8609964590:AAGgHQO5DInZ71-xydWrGc9DiIgZoa2zqpw";
+const String TG_CHAT = "8613422761";
+const unsigned long TG_COOLDOWN = 300000; // 5 min between repeat alarm msgs
+unsigned long lastTgAlarmMsg = 0;
+int lastTgCode = 0;
+String lastTgResp = "never sent";
+
 // ===== MockAPI cloud config: single-row live state (PUT id=1, never fills 100) =====
 String MOCKAPI_URL = "https://6465a133228bd07b354eb182.mockapi.io/readings";
 const String CLOUD_FIXED_ID = "1"; // always overwrite row 1
@@ -152,11 +160,58 @@ void cloudUpdate() {
 // Kept name so existing callers/routes keep working
 void postToCloud() { cloudUpdate(); }
 
+void tgSend(const String& msg) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[TG] Skipped - WiFi not connected"));
+    return;
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15);
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage";
+  Serial.printf("[TG] Sending (heap %d): %s\n", ESP.getFreeHeap(), msg.c_str());
+  if (!http.begin(client, url)) {
+    Serial.println(F("[TG] ERROR: http.begin failed"));
+    lastTgCode = -100;
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  String body = "{\"chat_id\":\"" + TG_CHAT + "\",\"text\":\"" + msg + "\"}";
+  lastTgCode = http.POST(body);
+  lastTgResp = http.getString().substring(0, 120);
+  lastTgResp.replace("\"", "'");
+  lastTgResp.replace("\n", " ");
+  lastTgResp.replace("\r", " ");
+  Serial.printf("[TG] Code %d (%s) %s\n", lastTgCode, http.errorToString(lastTgCode).c_str(), lastTgResp.c_str());
+  http.end();
+  delay(300);
+  yield();
+}
+
+void tgAlarm(const String& why) {
+  unsigned long now = millis();
+  if (now - lastTgAlarmMsg < TG_COOLDOWN) {
+    Serial.println(F("[TG] Alarm cooldown - not resending"));
+    return;
+  }
+  lastTgAlarmMsg = now;
+  char m[200];
+  snprintf(m, sizeof(m), "ALARM %s! Temp:%sC Hum:%s%% Gas:%d/1023 Relay:%s IP:%s",
+    why.c_str(),
+    isnan(gTemp) ? "--" : String(gTemp, 1).c_str(),
+    isnan(gHum) ? "--" : String(gHum, 0).c_str(),
+    gGas, gRelayOn ? "ON" : "OFF",
+    WiFi.localIP().toString().c_str());
+  tgSend(String(m));
+}
+
 void handleRoot() {
   logRequest("PAGE  GET /");
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<style>body{font-family:Arial;text-align:center;background:#1e1e2e;color:#fff;padding:20px;}";
-  html += ".card{background:#313244;padding:15px;border-radius:12px;margin:10px auto;max-width:400px;}";
+  html += ".card{background:#313244;padding:15px;border-radius:12px;margin:10px auto;max-width:400px;overflow:hidden;}";
+  html += ".stat{font-size:12px;word-break:break-all;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.4;}";
   html += ".big{font-size:32px;font-weight:bold;} .danger{color:#f38ba8;} .ok{color:#a6e3a1;}";
   html += ".btn{display:inline-block;padding:12px 20px;margin:6px;font-size:16px;color:#fff;background:#74c7ec;border:none;border-radius:8px;cursor:pointer;text-decoration:none;}";
   html += ".btn-led{background:#f9e2af;color:#111;} .btn-mario{background:#a6e3a1;color:#111;} .btn-red{background:#f38ba8;color:#111;}</style></head><body>";
@@ -179,8 +234,10 @@ void handleRoot() {
   html += "<button class='btn btn-mario' onclick=\"cmd('/play/mario')\">Mario</button>";
   html += "<button class='btn' onclick=\"cmd('/play/siren')\">Siren</button>";
   html += "<button class='btn' onclick=\"cmd('/note?freq=262')\">C4</button>";
-  html += "<h3>Cloud (MockAPI PUT id=1)</h3><div class='card'><div>Last PUT: <span id='cloud'>--</span></div><div style='font-size:12px'>Auto every 30s, single row, never fills</div></div>";
+  html += "<h3>Cloud (MockAPI PUT id=1)</h3><div class='card'><div>Last PUT:</div><div class='stat'><span id='cloud'>--</span></div><div style='font-size:12px'>Auto every 30s, single row, never fills</div></div>";
   html += "<button class='btn' onclick=\"cmd('/cloud/test')\">Update Now</button>";
+  html += "<h3>Telegram (@Foster82_bot)</h3><div class='card'><div>Last TG:</div><div class='stat'><span id='tg'>--</span></div></div>";
+  html += "<button class='btn' onclick=\"cmd('/tg/test')\">Send Test</button>";
   html += "<p><a href='/api' style='color:#89b4fa'>JSON API: /api</a></p>";
   html += "<script>";
   html += "function cmd(u){fetch(u).then(()=>update());}";
@@ -194,7 +251,8 @@ void handleRoot() {
   html += "document.getElementById('mode').textContent=d.auto?'AUTO':'MANUAL';";
   html += "document.getElementById('alarm').textContent=d.alarm?'ACTIVE!':(d.muted?'MUTED':'off');";
   html += "document.getElementById('led').textContent=d.ledAuto?('AUTO ('+(d.alarm?'ALARM blink':(d.wifi?'heartbeat':'fast blink'))+')'):(d.ledOn?'MANUAL ON':'MANUAL OFF');";
-  html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+d.cloudResp;";
+  html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+(d.cloudResp||'').substring(0,80);";
+  html += "document.getElementById('tg').textContent='code '+d.tgCode+' | '+(d.tgResp||'').substring(0,60);";
   html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
   html += "}catch(e){}} setInterval(update,2000);update();";
   html += "</script></body></html>";
@@ -215,6 +273,8 @@ void handleApi() {
   j += "\"ledOn\":" + String(digitalRead(LED_PIN) == LOW ? "true" : "false") + ",";
   j += "\"cloudCode\":" + String(lastCloudCode) + ",";
   j += "\"cloudResp\":\"" + lastCloudResp + "\",";
+  j += "\"tgCode\":" + String(lastTgCode) + ",";
+  j += "\"tgResp\":\"" + lastTgResp + "\",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
@@ -338,6 +398,13 @@ void setup() {
     server.sendHeader("Location", "/");
     server.send(303);
   });
+
+  server.on("/tg/test", []() {
+    logRequest("TG manual test");
+    tgSend("Test from Smart Room Guard. Temp:" + String(isnan(gTemp) ? "--" : String(gTemp, 1)) + "C Gas:" + String(gGas));
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
   
   server.on("/led/on", []() {
     logRequest("LED   LED ON manual");
@@ -436,6 +503,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Ready! Open http://%s in browser (laptop on Green or Green_5G)\n\n",
                   WiFi.localIP().toString().c_str());
+    tgSend("Smart Room Guard online. IP http://" + WiFi.localIP().toString());
   } else {
     Serial.println(F("Ready, but WiFi NOT connected yet - fix WiFi, then open ESP IP\n"));
   }
@@ -467,10 +535,13 @@ void loop() {
     bool shouldAlarm = (!isnan(gTemp) && gTemp > TEMP_ALARM) || (gGas > GAS_ALARM);
     if (shouldAlarm && !gAlarm) {
       Serial.println(F("[ALARM] TRIGGERED! (high temp or gas leak)"));
+      String why = (!isnan(gTemp) && gTemp > TEMP_ALARM) ? "HIGH TEMP" : "GAS LEAK";
+      tgAlarm(why);
     } else if (!shouldAlarm && gAlarm) {
       Serial.println(F("[ALARM] Cleared"));
       noTone(BUZZER_PIN);
       alarmBeepOn = false;
+      tgSend("Alarm cleared. Temp:" + String(isnan(gTemp) ? "--" : String(gTemp, 1)) + "C Gas:" + String(gGas));
     }
     gAlarm = shouldAlarm;
     if (gAlarmMuted && !gAlarm) gAlarmMuted = false; // auto unmute when safe
