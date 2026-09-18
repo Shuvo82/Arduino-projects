@@ -2,7 +2,22 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <SoftwareSerial.h>  // ESP SoftwareSerial for GPS (HW Serial = USB logs)
+#include <TinyGPS++.h>       // Install: Library Manager -> "TinyGPSPlus" by Mikal Hart
 #include <DHT.h>  // Install: Library Manager -> "DHT sensor library" by Adafruit + "Adafruit Unified Sensor"
+
+// ===== GPS (GY-GPS6MV2 / NEO-6M, 9600 baud) =====
+// Wiring: GPS VCC->3V3, GND->G, GPS TX->D2. Leave GPS RX unconnected (we only listen).
+// Take outdoors for first fix (cold start 1-13 min). Indoors = "No fix" is normal.
+const int GPS_RX_PIN = D2;  // ESP RX <- GPS TX
+const int GPS_TX_PIN = D7;  // ESP TX (unused, kept for SoftwareSerial)
+SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+TinyGPSPlus gps;
+double gLat = 0, gLng = 0;
+int gSats = 0;
+double gSpeedKmph = 0;
+bool gGpsValid = false;
+unsigned long lastGpsLog = 0;
 
 // ===== Telegram alerts (Foster82_bot) =====
 const String TG_TOKEN = "8609964590:AAGgHQO5DInZ71-xydWrGc9DiIgZoa2zqpw";
@@ -122,16 +137,20 @@ void cloudUpdate() {
     Serial.println(F("[CLOUD] Skipped - WiFi not connected"));
     return;
   }
-  char payload[160];
+  char payload[240];
+  char latS[16], lngS[16];
+  if (gGpsValid) { snprintf(latS, sizeof(latS), "%.6f", gLat); snprintf(lngS, sizeof(lngS), "%.6f", gLng); }
+  else { strcpy(latS, "null"); strcpy(lngS, "null"); }
   snprintf(payload, sizeof(payload),
-    "{\"temp\":%s,\"hum\":%s,\"gas\":%d,\"relay\":%s,\"alarm\":%s,\"rssi\":%d,\"uptime\":%lu}",
+    "{\"temp\":%s,\"hum\":%s,\"gas\":%d,\"relay\":%s,\"alarm\":%s,\"rssi\":%d,\"uptime\":%lu,\"lat\":%s,\"lng\":%s,\"sats\":%d}",
     isnan(gTemp) ? "null" : String(gTemp, 1).c_str(),
     isnan(gHum) ? "null" : String(gHum, 0).c_str(),
     gGas,
     gRelayOn ? "true" : "false",
     (gAlarm && !gAlarmMuted) ? "true" : "false",
     WiFi.RSSI(),
-    millis() / 1000);
+    millis() / 1000,
+    latS, lngS, gSats);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -207,13 +226,23 @@ void tgAlarm(const String& why) {
     return;
   }
   lastTgAlarmMsg = now;
-  char m[200];
-  snprintf(m, sizeof(m), "ALARM %s! Temp:%sC Hum:%s%% Gas:%d/1023 Relay:%s IP:%s",
-    why.c_str(),
-    isnan(gTemp) ? "--" : String(gTemp, 1).c_str(),
-    isnan(gHum) ? "--" : String(gHum, 0).c_str(),
-    gGas, gRelayOn ? "ON" : "OFF",
-    WiFi.localIP().toString().c_str());
+  char m[240];
+  if (gGpsValid) {
+    char la[16], lo[16];
+    snprintf(la, sizeof(la), "%.5f", gLat); snprintf(lo, sizeof(lo), "%.5f", gLng);
+    snprintf(m, sizeof(m), "ALARM %s! Temp:%sC Hum:%s%% Gas:%d/1023 Relay:%s Loc:%s,%s",
+      why.c_str(),
+      isnan(gTemp) ? "--" : String(gTemp, 1).c_str(),
+      isnan(gHum) ? "--" : String(gHum, 0).c_str(),
+      gGas, gRelayOn ? "ON" : "OFF", la, lo);
+  } else {
+    snprintf(m, sizeof(m), "ALARM %s! Temp:%sC Hum:%s%% Gas:%d/1023 Relay:%s IP:%s",
+      why.c_str(),
+      isnan(gTemp) ? "--" : String(gTemp, 1).c_str(),
+      isnan(gHum) ? "--" : String(gHum, 0).c_str(),
+      gGas, gRelayOn ? "ON" : "OFF",
+      WiFi.localIP().toString().c_str());
+  }
   tgSend(String(m));
 }
 
@@ -233,6 +262,8 @@ void handleRoot() {
   html += "<div>Air: <span id='air'>--</span></div></div>";
   html += "<div class='card'><div>Relay (Fan): <span id='relay'>--</span> | Mode: <span id='mode'>--</span></div>";
   html += "<div>Alarm: <span id='alarm'>--</span></div><div>Board LED: <span id='led'>--</span></div><div style='font-size:12px'>Updated: <span id='upd'>--</span></div></div>";
+  html += "<div class='card'><div>GPS (GY-GPS6MV2)</div><div class='stat'><span id='gps'>--</span></div>";
+  html += "<div><a id='maplink' href='#' target='_blank' style='color:#89b4fa'>Open in Maps</a></div></div>";
   html += "<button class='btn' onclick=\"cmd('/relay/on')\">Relay ON</button>";
   html += "<button class='btn' onclick=\"cmd('/relay/off')\">Relay OFF</button>";
   html += "<button class='btn' onclick=\"cmd('/relay/auto')\">AUTO</button>";
@@ -269,6 +300,9 @@ void handleRoot() {
   html += "document.getElementById('cloud').textContent='code '+d.cloudCode+' | '+(d.cloudResp||'');";
   html += "document.getElementById('tg').textContent='code '+d.tgCode+' | '+(d.tgResp||'');";
   html += "document.getElementById('siren').textContent=d.siren?'RUNNING (press Stop)':'off';";
+  html += "if(d.gpsValid){document.getElementById('gps').textContent=d.lat.toFixed(6)+','+d.lng.toFixed(6)+' | sats '+d.sats+' | '+d.speed+' km/h';";
+  html += "document.getElementById('maplink').href='https://maps.google.com/?q='+d.lat+','+d.lng;}";
+  html += "else{document.getElementById('gps').textContent='No fix ('+d.sats+' sats) - take outdoors';document.getElementById('maplink').href='#';}";
   html += "document.getElementById('upd').textContent=new Date().toLocaleTimeString();";
   html += "}catch(e){}} setInterval(update,2000);update();";
   html += "</script></body></html>";
@@ -292,6 +326,11 @@ void handleApi() {
   j += "\"tgCode\":" + String(lastTgCode) + ",";
   j += "\"tgResp\":\"" + lastTgResp + "\",";
   j += "\"siren\":" + String(sirenOn ? "true" : "false") + ",";
+  j += "\"gpsValid\":" + String(gGpsValid ? "true" : "false") + ",";
+  j += "\"lat\":" + String(gGpsValid ? String(gLat, 6) : "null") + ",";
+  j += "\"lng\":" + String(gGpsValid ? String(gLng, 6) : "null") + ",";
+  j += "\"sats\":" + String(gSats) + ",";
+  j += "\"speed\":" + String(gSpeedKmph, 1) + ",";
   j += "\"alarm\":" + String(gAlarm && !gAlarmMuted ? "true" : "false");
   j += "}";
   server.send(200, "application/json", j);
@@ -305,7 +344,9 @@ void setup() {
   Serial.println(F(" Smart Room Guard"));
   Serial.println(F(" Booting..."));
   Serial.println(F("======================================"));
-  Serial.println(F("[WIRING] DHT data->D6, MQ AO->A0, Relay IN->D1, Buzzer->D5"));
+  Serial.println(F("[WIRING] DHT data->D6, MQ AO->A0, Relay IN->D1, Buzzer->D5, GPS TX->D2"));
+  gpsSerial.begin(9600);
+  Serial.println(F("[GPS] GY-GPS6MV2 on D2 @9600 started - take outdoors for fix"));
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -585,8 +626,31 @@ unsigned long lastStatusPrint = 0;
 
 void loop() {
   server.handleClient();
+  // --- Feed GPS parser (every byte, non-blocking) ---
+  while (gpsSerial.available()) {
+    if (gps.encode(gpsSerial.read())) {
+      if (gps.location.isValid()) {
+        gLat = gps.location.lat();
+        gLng = gps.location.lng();
+        gGpsValid = true;
+      }
+      if (gps.satellites.isValid()) gSats = gps.satellites.value();
+      if (gps.speed.isValid()) gSpeedKmph = gps.speed.kmph();
+    }
+  }
   unsigned long now = millis();
-
+  // --- GPS status log every 10s ---
+  if (now - lastGpsLog > 10000) {
+    lastGpsLog = now;
+    if (gGpsValid && gps.location.age() > 10000) gGpsValid = false; // stale fix
+    if (gGpsValid) {
+      Serial.printf("[GPS] Fix lat=%.6f lng=%.6f sats=%d speed=%.1f km/h\n", gLat, gLng, gSats, gSpeedKmph);
+    } else if (gps.charsProcessed() < 10) {
+      Serial.println(F("[GPS] No NMEA data - check wiring GPS TX->D2, VCC 3V3, baud 9600"));
+    } else {
+      Serial.printf("[GPS] Waiting fix... chars=%lu sats=%d (take outdoors)\n", gps.charsProcessed(), gSats);
+    }
+  }
   // --- Read sensors every 2s ---
   if (now - lastSensorRead > 2000) {
     lastSensorRead = now;
